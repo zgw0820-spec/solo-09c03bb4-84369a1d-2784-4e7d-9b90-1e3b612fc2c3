@@ -9,7 +9,12 @@ applies it atomically. Properties implemented here:
   rejected, so a late/old transfer can never roll back the zone;
 * a background loop plus a startup pull re-sync automatically after a
   disconnect or a process restart, eventually catching up to the newest
-  version ("reconcile until current").
+  version ("reconcile until current");
+* the primary's current host isolation rides along in the zone payload
+  (it does not change the serial): a newer serial applies version and
+  isolation in one transaction, an equal serial reconciles only the
+  isolation slot, and an older serial is ignored entirely — so an old
+  isolation can never re-cover a newer zone.
 """
 from __future__ import annotations
 
@@ -23,6 +28,42 @@ from .config import settings
 from .storage import storage
 
 log = logging.getLogger("sync")
+
+
+def _parse_isolation(raw: Any) -> Optional[Dict[str, Any]]:
+    """Validate the isolation object embedded in a zone payload.
+
+    Returns None when absent. Raises ValueError when present but
+    malformed — a broken payload must fail the whole sync so the local
+    state stays untouched.
+    """
+    if raw is None:
+        return None
+    if not isinstance(raw, dict):
+        raise ValueError("isolation must be an object or null")
+    if not isinstance(raw.get("request_id"), str):
+        raise ValueError("isolation.request_id must be a string")
+    if not isinstance(raw.get("name"), str):
+        raise ValueError("isolation.name must be a string")
+    if not isinstance(raw.get("serial"), int):
+        raise ValueError("isolation.serial must be an integer")
+    if not isinstance(raw.get("duration"), int):
+        raise ValueError("isolation.duration must be an integer")
+    if not isinstance(raw.get("created_at"), str):
+        raise ValueError("isolation.created_at must be a string")
+    if not isinstance(raw.get("expires_at"), str):
+        raise ValueError("isolation.expires_at must be a string")
+    if not isinstance(raw.get("expires_epoch"), (int, float)):
+        raise ValueError("isolation.expires_epoch must be a number")
+    return {
+        "request_id": raw["request_id"],
+        "name": raw["name"],
+        "serial": raw["serial"],
+        "duration": raw["duration"],
+        "created_at": raw["created_at"],
+        "expires_at": raw["expires_at"],
+        "expires_epoch": float(raw["expires_epoch"]),
+    }
 
 
 class SyncOutcome:
@@ -73,10 +114,18 @@ async def sync_once(client: Optional[httpx.AsyncClient] = None) -> SyncOutcome:
         upstream_serial = int(payload.get("serial", -1))
         records = payload.get("records")
         published_at = payload.get("published_at")
+        try:
+            isolation = _parse_isolation(payload.get("isolation"))
+        except ValueError as exc:
+            isolation = None
+            isolation_error = str(exc)
+        else:
+            isolation_error = None
         if (
             upstream_serial < 1
             or not isinstance(records, list)
             or not isinstance(published_at, str)
+            or isolation_error is not None
             or any(
                 not isinstance(r, dict)
                 or not isinstance(r.get("name"), str)
@@ -84,14 +133,15 @@ async def sync_once(client: Optional[httpx.AsyncClient] = None) -> SyncOutcome:
                 for r in records
             )
         ):
-            err = "malformed zone payload from primary"
+            err = isolation_error or "malformed zone payload from primary"
             storage.update_sync_state("failed", err, upstream_serial)
             return SyncOutcome(
                 "failed", False, local_serial, upstream_serial, err
             )
 
-        if upstream_serial <= local_serial:
-            # Late/old transfer: must never roll back an active version.
+        if upstream_serial < local_serial:
+            # Late/old transfer: must never roll back an active version,
+            # and its old isolation must never re-cover the newer zone.
             storage.update_sync_state(
                 "ignored_stale", None, upstream_serial
             )
@@ -103,15 +153,46 @@ async def sync_once(client: Optional[httpx.AsyncClient] = None) -> SyncOutcome:
                 "ignored_stale", False, local_serial, upstream_serial
             )
 
-        # Apply the complete new version in one atomic transaction.
+        if upstream_serial == local_serial:
+            # Same zone version: only the isolation slot may differ.
+            # The isolation carries no serial bump, so it is reconciled
+            # here; the storage layer re-checks the serial match.
+            result = storage.apply_isolation(upstream_serial, isolation)
+            if result == "updated":
+                storage.update_sync_state(
+                    "isolation_updated", None, upstream_serial
+                )
+                log.info(
+                    "isolation reconciled at serial=%s: %s",
+                    upstream_serial,
+                    isolation["request_id"] if isolation else "cleared",
+                )
+                return SyncOutcome(
+                    "isolation_updated", False, local_serial,
+                    upstream_serial,
+                )
+            storage.update_sync_state(
+                "ignored_stale", None, upstream_serial
+            )
+            return SyncOutcome(
+                "ignored_stale", False, local_serial, upstream_serial
+            )
+
+        # Apply the complete new version plus its isolation state in one
+        # atomic transaction (the old isolation dies with the old zone).
         applied = storage.commit_version(
             upstream_serial,
             [{"name": r["name"], "ip": r["ip"]} for r in records],
             published_at,
+            isolation=isolation,
         )
         if applied:
             storage.update_sync_state("synced", None, upstream_serial)
-            log.info("applied serial=%s from primary", upstream_serial)
+            log.info(
+                "applied serial=%s from primary (isolation=%s)",
+                upstream_serial,
+                isolation["request_id"] if isolation else "none",
+            )
             return SyncOutcome(
                 "synced", True, upstream_serial, upstream_serial
             )

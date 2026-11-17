@@ -4,6 +4,13 @@ Every answer is built from one immutable version snapshot fetched in a
 single storage read, so a reply can never mix records of two versions.
 While a transfer is in progress the old version stays active and keeps
 being answered.
+
+Host isolation: while an isolation is effective for the active serial,
+A queries for the isolated name are answered SERVFAIL (the name is
+"blocked" without touching the zone data itself); every other name and
+query type is answered exactly as before. The snapshot pairs the zone
+version with the isolation state that belongs to it, so an answer never
+mixes a new zone with an old isolation or vice versa.
 """
 from __future__ import annotations
 
@@ -14,7 +21,7 @@ from dnslib import A, DNSRecord, RR, QTYPE, RCODE
 from dnslib.server import BaseResolver, DNSServer
 
 from .config import settings
-from .storage import storage
+from .storage import isolation_effective, storage
 
 log = logging.getLogger("dns")
 
@@ -41,8 +48,23 @@ class ZoneResolver(BaseResolver):
             reply.header.rcode = RCODE.NOERROR
             return reply
 
-        # One consistent snapshot -> one version per answer.
-        serial, records, _ = storage.get_active_version()
+        # One consistent snapshot -> one version per answer, paired with
+        # the isolation state that belongs to that same version.
+        serial, records, _, isolation = storage.get_active_state()
+
+        if (
+            isolation_effective(isolation, serial)
+            and qname == isolation["name"]
+        ):
+            # Isolated host: block only this name's A answers.
+            reply.header.rcode = RCODE.SERVFAIL
+            log.info(
+                "SERVFAIL %s isolated until %s (serial=%s, request=%s)",
+                qname, isolation["expires_at"], serial,
+                isolation["request_id"],
+            )
+            return reply
+
         name_map = {}
         for rec in records:
             name_map.setdefault(rec["name"], []).append(rec["ip"])

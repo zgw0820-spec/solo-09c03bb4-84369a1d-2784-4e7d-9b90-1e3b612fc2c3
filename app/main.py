@@ -4,18 +4,31 @@ from __future__ import annotations
 import logging
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Response
 
 from .config import settings
 from .dns_server import dns_service
 from .models import (
+    IsolationOut,
+    IsolationRequest,
+    IsolationStatus,
+    IsolationSubmitResult,
+    IsolationView,
     PublishResult,
     RecordOut,
     VersionOut,
     ZoneOut,
     ZonePayload,
 )
-from .storage import storage
+from .storage import (
+    ISO_BUSY,
+    ISO_CONFLICT_REQUEST_ID,
+    ISO_CREATED,
+    ISO_NAME_NOT_FOUND,
+    ISO_STALE_SERIAL,
+    isolation_effective,
+    storage,
+)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -24,18 +37,29 @@ logging.basicConfig(
 log = logging.getLogger("main")
 
 
+def _effective_isolation(
+    serial: int, isolation: dict | None
+) -> dict | None:
+    """The isolation only counts when it matches this exact serial and
+    its absolute deadline has not passed."""
+    return isolation if isolation_effective(isolation, serial) else None
+
+
 def _zone_out() -> ZoneOut:
-    serial, records, published_at = storage.get_active_version()
+    serial, records, published_at, isolation = storage.get_active_state()
+    isolation = _effective_isolation(serial, isolation)
     return ZoneOut(
         zone=settings.dns_zone,
         serial=serial,
         records=[RecordOut(**r) for r in records],
         published_at=published_at,
+        isolation=IsolationOut.from_row(isolation) if isolation else None,
     )
 
 
 def _version_out() -> VersionOut:
-    serial, records, published_at = storage.get_active_version()
+    serial, records, published_at, isolation = storage.get_active_state()
+    isolation = _effective_isolation(serial, isolation)
     sync_state = storage.get_sync_state()
     return VersionOut(
         role=settings.role,
@@ -47,6 +71,9 @@ def _version_out() -> VersionOut:
         last_sync_status=sync_state["last_sync_status"],
         last_sync_error=sync_state["last_sync_error"] or None,
         upstream_serial=sync_state["upstream_serial"],
+        isolation=(
+            IsolationStatus.from_row(isolation) if isolation else None
+        ),
     )
 
 
@@ -77,11 +104,13 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="Primary/Backup DNS for fixed intranet zone",
-    version="1.0.0",
+    version="1.1.0",
     description=(
         "Primary accepts a complete zone (up to 8 A records); the backup "
         "pulls whole versions over HTTP and answers A queries over UDP. "
-        "Every answer uses one immutable version."
+        "Every answer uses one immutable version. A host-isolation API "
+        "temporarily blocks one published A name (SERVFAIL) on both "
+        "servers without touching the zone serial."
     ),
     lifespan=lifespan,
 )
@@ -125,6 +154,100 @@ def publish_zone(payload: ZonePayload) -> PublishResult:
         serial=serial,
         record_count=len(records),
         published_at=published_at,
+    )
+
+
+# -------------------------------------------------------------- isolation
+@app.post(
+    "/api/isolation",
+    response_model=IsolationSubmitResult,
+    tags=["isolation"],
+)
+def submit_isolation(
+    payload: IsolationRequest, response: Response
+) -> IsolationSubmitResult:
+    """Isolate one published A name for 30-300 seconds (primary only).
+
+    The request carries the zone serial the operator observed, the
+    published A name, an idempotency key (``request_id``) and the
+    duration. Only one name can be isolated at a time. The isolation
+    does not change the zone serial; it replicates to the backup with
+    the normal zone sync. A retry of the same ``request_id`` returns the
+    stored isolation unchanged and never extends its deadline.
+    """
+    if not settings.is_primary:
+        raise HTTPException(
+            status_code=403,
+            detail="isolation is only accepted on the primary",
+        )
+    status, isolation, active_serial = storage.submit_isolation(
+        request_id=payload.request_id,
+        name=payload.name,
+        serial=payload.serial,
+        duration=payload.duration,
+    )
+    if status == ISO_STALE_SERIAL:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"observed serial {payload.serial} does not match the "
+                f"active serial {active_serial}; re-read /api/zone and "
+                "file the isolation against the current serial"
+            ),
+        )
+    if status == ISO_NAME_NOT_FOUND:
+        raise HTTPException(
+            status_code=404,
+            detail=(
+                f"no published A record named {payload.name!r} in the "
+                f"active zone (serial {active_serial})"
+            ),
+        )
+    if status == ISO_CONFLICT_REQUEST_ID:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"request_id {payload.request_id!r} was already used with "
+                "different parameters; choose a new request_id"
+            ),
+        )
+    if status == ISO_BUSY:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"only one name can be isolated at a time; "
+                f"{isolation['name']!r} is isolated until "
+                f"{isolation['expires_at']} "
+                f"(request_id={isolation['request_id']!r})"
+            ),
+        )
+    # created | duplicate: the stored row is authoritative; a duplicate
+    # retry returns it unchanged and never extends the deadline.
+    log.info(
+        "isolation %s request=%s name=%s serial=%s expires=%s",
+        status, isolation["request_id"], isolation["name"],
+        isolation["serial"], isolation["expires_at"],
+    )
+    if status == ISO_CREATED:
+        response.status_code = 201
+    return IsolationSubmitResult(
+        ok=True,
+        status=status,
+        isolation=IsolationStatus.from_row(isolation),
+    )
+
+
+@app.get("/api/isolation", response_model=IsolationView, tags=["isolation"])
+def get_isolation() -> IsolationView:
+    """Current effective isolation on this machine (both roles)."""
+    serial, _, _, isolation = storage.get_active_state()
+    isolation = _effective_isolation(serial, isolation)
+    return IsolationView(
+        zone=settings.dns_zone,
+        serial=serial,
+        isolation=(
+            IsolationStatus.from_row(isolation) if isolation else None
+        ),
     )
 
 
